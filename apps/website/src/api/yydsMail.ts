@@ -1,6 +1,4 @@
-export const API_BASE_URL = (
-  import.meta.env.VITE_YYDS_API_BASE_URL ?? "https://maliapi.215.im/v1"
-).replace(/\/$/, "");
+export const API_BASE_URL = (import.meta.env.VITE_YYDS_API_BASE_URL ?? "/v1").replace(/\/$/, "");
 
 /** 解析为浏览器可请求的绝对 URL（支持相对路径如 `/v1`，配合 dev 代理避免 CORS） */
 function resolveApiUrl(path: string): string {

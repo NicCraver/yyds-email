@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "ready": "vp fmt && vp lint && vp run test -r && vp run build -r",
-    "build": "pnpm --filter website build",
+    "build": "pnpm --filter website build && node scripts/sync-cloudflare-functions.mjs",
     "dev": "vp run website#dev",
     "prepare": "vp config"
   },

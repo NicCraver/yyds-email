@@ -9,6 +9,9 @@ lerna-debug.log*
 
 node_modules
 dist
+
+# Monorepo root `pnpm build` copies Pages functions here when CF project root = repo root
+/functions
 dist-ssr
 *.local
 
