@@ -1,10 +1,12 @@
-# YYDS Mail
+# yyds-email
 
-YYDS Mail 是免费临时邮箱与邮箱 API 平台：无需注册、隐私优先、支持自定义域名与 WebSocket 实时收件。
+本仓库为自用维护的前端或配套工具，**使用 [YYDS Mail](https://vip.215.im/) 官方提供的临时邮箱与 API 服务**（并非 fork 或基于其开源代码），方便在有限场景下快速创建邮箱并收信（例如注册验证等），非对外公共服务。
+
+API、控制台与计费规则以 **YYDS Mail** 官方说明为准。
 
 ## 快速使用
 
-打开官网即可使用：**[YYDS Mail](https://vip.215.im/)**
+使用服务请打开：**[YYDS Mail](https://vip.215.im/)**
 
 ## Development
 
@@ -34,8 +36,8 @@ vp run dev
 
 ## 致谢
 
-感谢 [Linux.do 社区](https://linux.do/) 的讨论与支持：[相关话题](https://linux.do/t/topic/1842276)。
+感谢 [Linux.do 社区](https://linux.do/) 的讨论与支持。
 
-特别感谢 **小辣椒**：
+特别感谢 [**小辣椒**](https://linux.do/u/xiaolajiao)：
 
 <img src="https://cdn3.linux.do/optimized/4X/d/a/1/da1aced54a4f60417e47b47f924f182e1823925c_2_144x144.gif" alt="小辣椒" width="72" height="72" />
