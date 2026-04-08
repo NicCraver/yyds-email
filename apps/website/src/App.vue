@@ -627,7 +627,7 @@ function formatRelativeTime(iso: string) {
       <Transition name="slide-fade">
         <div
           v-if="error"
-          class="mb-6 flex items-start gap-2.5 rounded-2xl border border-error/25 bg-error-container px-4 py-3 text-[13px] text-on-error-container md:text-sm"
+          class="mb-6 flex items-center gap-2.5 rounded-2xl border border-error/25 bg-error-container px-4 py-3 text-[13px] text-on-error-container md:text-sm"
           role="alert"
         >
           <span class="material-symbols-outlined shrink-0 text-error">error</span>
