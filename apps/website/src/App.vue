@@ -552,7 +552,7 @@ function formatRelativeTime(iso: string) {
 
 <template>
   <div
-    class="min-h-dvh bg-background font-body text-on-surface selection:bg-primary-container selection:text-on-primary-container"
+    class="flex min-h-dvh flex-col bg-background font-body text-on-surface selection:bg-primary-container selection:text-on-primary-container"
   >
     <!-- TopNavBar -->
     <nav
@@ -611,7 +611,7 @@ function formatRelativeTime(iso: string) {
       </div>
     </nav>
 
-    <main class="mx-auto max-w-7xl px-6 pb-20 pt-32">
+    <main class="mx-auto w-full max-w-7xl flex-1 px-6 pb-20 pt-32">
       <!-- Toast -->
       <Transition name="fade">
         <p
