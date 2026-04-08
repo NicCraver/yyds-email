@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "ready": "vp fmt && vp lint && vp run test -r && vp run build -r",
+    "build": "pnpm --filter website build",
     "dev": "vp run website#dev",
     "prepare": "vp config"
   },
