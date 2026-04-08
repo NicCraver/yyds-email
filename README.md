@@ -1,8 +1,8 @@
 # yyds-email
 
-本仓库为自用维护的前端或配套工具，**使用 [YYDS Mail](https://vip.215.im/) 官方提供的临时邮箱与 API 服务**（并非 fork 或基于其开源代码），方便在有限场景下快速创建邮箱并收信（例如注册验证等），非对外公共服务。
+一站式临时邮箱服务，专为接收验证码而生。几秒内生成一次性邮箱地址，自动识别并提取验证码，一键复制即用。
 
-API、控制台与计费规则以 **YYDS Mail** 官方说明为准。
+基于 Vue 3 + Tailwind CSS 构建，采用 Vite+ 单体仓库管理，支持亮色/暗色主题与邮件实时轮询。
 
 ## 快速使用
 
@@ -34,9 +34,11 @@ vp run build -r
 vp run dev
 ```
 
-## 致谢
+## Community
 
-感谢 [Linux.do 社区](https://linux.do/) 的讨论与支持。
+- Community link: [LINUX DO](https://linux.do)
+
+## 致谢
 
 特别感谢 [**小辣椒**](https://linux.do/u/xiaolajiao)：
 

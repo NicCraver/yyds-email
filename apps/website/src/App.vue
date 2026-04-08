@@ -74,8 +74,29 @@ function showToast(text: string) {
 }
 
 async function copyText(text: string, label = "已复制") {
+  if (navigator.clipboard?.writeText && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast(label);
+      return;
+    } catch {
+      /* 异步后部分浏览器会撤销用户激活导致失败，改用 execCommand 回退 */
+    }
+  }
   try {
-    await navigator.clipboard.writeText(text);
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.cssText = "position:fixed;left:-9999px;top:0;opacity:0";
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    ta.setSelectionRange(0, text.length);
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    if (!ok) {
+      throw new Error("execCommand copy failed");
+    }
     showToast(label);
   } catch {
     error.value = "复制失败，请手动选择文本复制";
@@ -366,8 +387,8 @@ async function createInbox() {
     selectedId.value = null;
     detail.value = null;
     persistInbox(data);
-    await fetchMessages();
     await copyText(data.address, "邮箱已创建并已复制");
+    await fetchMessages();
   } catch (e) {
     error.value = e instanceof Error ? e.message : "创建失败";
   } finally {
@@ -427,8 +448,8 @@ async function createAnotherInbox() {
       domain: domain.value.trim() || undefined,
     });
     persistInbox(data);
-    await fetchMessages();
     await copyText(data.address, "新邮箱已创建并已复制");
+    await fetchMessages();
   } catch (e) {
     error.value = e instanceof Error ? e.message : "创建失败";
   } finally {
@@ -620,10 +641,13 @@ function formatRelativeTime(iso: string) {
           <h1
             class="mb-6 font-headline text-4xl font-extrabold leading-[1.1] tracking-tight text-on-surface md:text-5xl lg:text-6xl"
           >
-            <span class="text-primary">临时邮箱</span>收验证码，真实邮箱不必露面。
+            <span class="text-primary">临时邮箱</span>，快速创建、轻松收码。
           </h1>
-          <p class="mb-8 max-w-xl text-lg leading-relaxed text-on-surface-variant">
-            几秒生成地址、自动识别验证码；少填一次真实邮箱，多一分安心。
+          <p class="mb-4 max-w-xl text-lg leading-relaxed text-on-surface-variant">
+            几秒生成地址、自动识别验证码，一键复制即用。
+          </p>
+          <p class="mb-8 max-w-xl text-sm text-on-surface-variant/70">
+            每个临时邮箱只接收第一封邮件，收到后自动停止轮询。
           </p>
 
           <div
@@ -881,7 +905,9 @@ function formatRelativeTime(iso: string) {
               :class="
                 selectedId === m.id
                   ? 'border-primary/35 shadow-md ring-1 ring-primary/20'
-                  : 'border-outline-variant/10 dark:border-outline-variant/25'
+                  : m.seen
+                    ? 'border-outline-variant/15 dark:border-outline-variant/30'
+                    : 'border-primary/35 bg-primary-container/10 dark:border-primary/45'
               "
             >
               <div
@@ -907,8 +933,8 @@ function formatRelativeTime(iso: string) {
                 class="group flex cursor-pointer flex-col gap-4 p-5 transition-all md:flex-row md:items-center"
                 :class="
                   m.seen
-                    ? 'bg-surface hover:border-primary/20 hover:bg-surface-container-high border border-transparent hover:scale-[1.01]'
-                    : 'border-primary/15 bg-primary-container/10 hover:bg-primary-container/20 hover:scale-[1.01] border'
+                    ? 'bg-surface hover:bg-surface-container-high hover:scale-[1.01]'
+                    : 'bg-transparent hover:bg-primary-container/20 hover:scale-[1.01]'
                 "
                 role="button"
                 tabindex="0"
@@ -1089,15 +1115,6 @@ function formatRelativeTime(iso: string) {
           </div>
         </Transition>
       </section>
-
-      <!-- Security -->
-      <section id="security" class="mt-16 max-w-3xl">
-        <h2 class="mb-3 font-headline text-2xl font-extrabold text-on-surface">隐私与安全</h2>
-        <p class="leading-relaxed text-on-surface-variant">
-          请勿将 API Key
-          或会话令牌提交到公开仓库。临时邮箱仅供合法测试与注册场景使用；请遵守当地法律与服务条款。
-        </p>
-      </section>
     </main>
 
     <footer
@@ -1112,7 +1129,7 @@ function formatRelativeTime(iso: string) {
         >
           <a
             class="transition-colors hover:text-primary hover:underline hover:decoration-2 hover:underline-offset-4"
-            href="https://github.com/xiaolajiaoyyds"
+            href="https://github.com/NicCraver/yyds-email"
             target="_blank"
             rel="noopener noreferrer"
             >GitHub</a
@@ -1125,9 +1142,6 @@ function formatRelativeTime(iso: string) {
             >文档</a
           >
         </div>
-        <p class="font-label text-[10px] uppercase tracking-widest text-on-surface-variant/60">
-          仅供合法用途使用
-        </p>
       </div>
     </footer>
   </div>
