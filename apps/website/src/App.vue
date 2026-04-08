@@ -13,6 +13,7 @@ import {
 } from "./api/yydsMail";
 import { filterInboxMessages } from "./lib/messageFilters";
 import {
+  extractVerificationCodes,
   extractVerificationCodesFromSubjectLine,
   getMessageBodyText,
   subjectHasVerificationMarker,
@@ -20,6 +21,7 @@ import {
 
 const LS_API_KEY = "yyds-mail-api-key";
 const LS_INBOX = "yyds-mail-inbox";
+const LS_THEME = "yyds-mail-theme";
 
 interface StoredInbox {
   id: string;
@@ -41,8 +43,22 @@ const loading = ref(false);
 const detailLoading = ref(false);
 const error = ref<string | null>(null);
 const toast = ref<string | null>(null);
-const pollMs = 12000;
+const pollMs = 3000;
+const isDark = ref(false);
+const nowTick = ref(Date.now());
+/** 下次自动拉取邮件列表的时间戳（用于「等待接收邮件」旁倒计时） */
+const nextInboxPollAt = ref<number | null>(null);
 let pollTimer: ReturnType<typeof setInterval> | null = null;
+let tickTimer: ReturnType<typeof setInterval> | null = null;
+
+const nextPollCountdownSec = computed(() => {
+  if (nextInboxPollAt.value === null) {
+    return null;
+  }
+  // 与 nextInboxPollAt（按 Date.now() 设定）同一时钟；勿用 nowTick 相减，否则 tick 落后真实时间约 1s 会 ceil 成 4
+  void nowTick.value;
+  return Math.max(0, Math.ceil((nextInboxPollAt.value - Date.now()) / 1000));
+});
 
 function listRowCodes(
   m: MessageSummary,
@@ -86,6 +102,37 @@ function loadStored() {
 
 loadStored();
 
+function initTheme() {
+  try {
+    const t = localStorage.getItem(LS_THEME);
+    const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+    if (t === "dark" || (t !== "light" && prefersDark)) {
+      isDark.value = true;
+      document.documentElement.classList.add("dark");
+      document.documentElement.classList.remove("light");
+    } else {
+      isDark.value = false;
+      document.documentElement.classList.add("light");
+      document.documentElement.classList.remove("dark");
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+function toggleDark() {
+  isDark.value = !isDark.value;
+  if (isDark.value) {
+    document.documentElement.classList.add("dark");
+    document.documentElement.classList.remove("light");
+    localStorage.setItem(LS_THEME, "dark");
+  } else {
+    document.documentElement.classList.add("light");
+    document.documentElement.classList.remove("dark");
+    localStorage.setItem(LS_THEME, "light");
+  }
+}
+
 function persistInbox(data: TempInbox) {
   const token = data.token;
   if (!token) {
@@ -108,6 +155,118 @@ watch(apiKey, (v) => {
 const hasInbox = computed(() => inbox.value !== null);
 
 const visibleMessages = computed(() => filterInboxMessages(messages.value));
+
+const visibleMessagesWithCodes = computed(() =>
+  visibleMessages.value.map((m) => ({
+    ...m,
+    _codes: extractVerificationCodesFromSubjectLine(m.subject ?? ""),
+  })),
+);
+
+/** 用于在「快速设置」卡片内直接展示可复制验证码（标题可解析时免请求；否则拉取最新一封可见邮件正文解析） */
+const setupInboxCodes = ref<ReturnType<typeof extractVerificationCodes>>([]);
+let setupCodesFetchGeneration = 0;
+
+const sortedVisibleMessages = computed(() =>
+  [...visibleMessages.value].sort(
+    (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+  ),
+);
+
+const setupCodesTrigger = computed(() => {
+  if (!inbox.value?.token) {
+    return "";
+  }
+  return sortedVisibleMessages.value.map((m) => `${m.id}\t${m.subject ?? ""}`).join("\n");
+});
+
+async function refreshSetupInboxCodes() {
+  const token = inbox.value?.token;
+  const addr = inbox.value?.address;
+  if (!token || !addr) {
+    setupCodesFetchGeneration++;
+    setupInboxCodes.value = [];
+    return;
+  }
+
+  const sorted = sortedVisibleMessages.value;
+
+  for (const m of sorted) {
+    const fromSubject = listRowCodes(m);
+    if (fromSubject.length) {
+      setupCodesFetchGeneration++;
+      setupInboxCodes.value = fromSubject;
+      return;
+    }
+  }
+
+  const newest = sorted[0];
+  if (!newest) {
+    setupCodesFetchGeneration++;
+    setupInboxCodes.value = [];
+    return;
+  }
+
+  const gen = ++setupCodesFetchGeneration;
+  try {
+    const d = await getMessageDetail({
+      bearerToken: token,
+      id: newest.id,
+      address: addr,
+    });
+    if (gen !== setupCodesFetchGeneration) {
+      return;
+    }
+    setupInboxCodes.value = extractVerificationCodes(d);
+  } catch {
+    if (gen !== setupCodesFetchGeneration) {
+      return;
+    }
+    setupInboxCodes.value = [];
+  }
+}
+
+watch(
+  setupCodesTrigger,
+  () => {
+    void refreshSetupInboxCodes();
+  },
+  { immediate: true },
+);
+
+const expiresCountdown = computed(() => {
+  if (!inbox.value) {
+    return "00:00";
+  }
+  const end = new Date(inbox.value.expiresAt).getTime();
+  const ms = Math.max(0, end - nowTick.value);
+  const totalSec = Math.floor(ms / 1000);
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+});
+
+function startExpiryTick() {
+  stopExpiryTick();
+  tickTimer = window.setInterval(() => {
+    nowTick.value = Date.now();
+  }, 1000);
+}
+
+function stopExpiryTick() {
+  if (tickTimer) {
+    clearInterval(tickTimer);
+    tickTimer = null;
+  }
+}
+
+watch(hasInbox, (v) => {
+  if (v) {
+    startExpiryTick();
+  } else {
+    stopExpiryTick();
+  }
+});
 
 async function ensureSession(): Promise<string | null> {
   const token = inbox.value?.token;
@@ -136,9 +295,21 @@ async function fetchMessages() {
       address: inbox.value.address,
       limit: 50,
     });
+    // 清除会话等操作可能在请求途中发生，避免继续写入状态或重置轮询
+    if (!inbox.value) {
+      return;
+    }
     messages.value = res.messages;
     unreadCount.value = res.unreadCount;
+    if (res.messages.length > 0) {
+      stopPoll();
+    } else if (pollTimer) {
+      nextInboxPollAt.value = Date.now() + pollMs;
+    }
   } catch (e) {
+    if (!inbox.value) {
+      return;
+    }
     error.value = e instanceof Error ? e.message : "加载邮件失败";
   }
 }
@@ -191,10 +362,10 @@ async function createInbox() {
       address: addressPrefix.value.trim() || undefined,
       domain: domain.value.trim() || undefined,
     });
-    persistInbox(data);
     messages.value = [];
     selectedId.value = null;
     detail.value = null;
+    persistInbox(data);
     await fetchMessages();
     await copyText(data.address, "邮箱已创建并已复制");
   } catch (e) {
@@ -227,6 +398,7 @@ async function refreshToken() {
 }
 
 function clearInbox() {
+  stopPoll();
   inbox.value = null;
   messages.value = [];
   selectedId.value = null;
@@ -234,11 +406,49 @@ function clearInbox() {
   localStorage.removeItem(LS_INBOX);
 }
 
+/** 保留已填写的 API Key 与可选前缀/域名；不先清空 inbox，避免界面切回连接服务页 */
+async function createAnotherInbox() {
+  const key = apiKey.value.trim();
+  if (!key) {
+    error.value =
+      "无法新建：未找到 API Key。请先点击「清除会话」，在连接服务处填写 API Key 后再生成。";
+    return;
+  }
+  loading.value = true;
+  error.value = null;
+  messages.value = [];
+  selectedId.value = null;
+  detail.value = null;
+  stopPoll();
+  try {
+    const data = await createTempInbox({
+      apiKey: key,
+      address: addressPrefix.value.trim() || undefined,
+      domain: domain.value.trim() || undefined,
+    });
+    persistInbox(data);
+    await fetchMessages();
+    await copyText(data.address, "新邮箱已创建并已复制");
+  } catch (e) {
+    error.value = e instanceof Error ? e.message : "创建失败";
+  } finally {
+    loading.value = false;
+  }
+}
+
 function startPoll() {
   stopPoll();
-  pollTimer = setInterval(() => {
+  if (!inbox.value || messages.value.length > 0) {
+    return;
+  }
+  pollTimer = window.setInterval(() => {
+    if (!inbox.value) {
+      stopPoll();
+      return;
+    }
     void fetchMessages();
   }, pollMs);
+  nextInboxPollAt.value = Date.now() + pollMs;
 }
 
 function stopPoll() {
@@ -246,9 +456,22 @@ function stopPoll() {
     clearInterval(pollTimer);
     pollTimer = null;
   }
+  nextInboxPollAt.value = null;
+}
+
+function scrollToSection(id: string) {
+  document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function navToInbox() {
+  scrollToSection(hasInbox.value ? "inbox" : "setup");
 }
 
 onMounted(async () => {
+  initTheme();
+  if (inbox.value?.token) {
+    startExpiryTick();
+  }
   if (inbox.value?.token) {
     loading.value = true;
     const ok = await ensureSession();
@@ -262,6 +485,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   stopPoll();
+  stopExpiryTick();
 });
 
 watch(inbox, (v) => {
@@ -285,55 +509,93 @@ function formatTime(iso: string) {
     return iso;
   }
 }
+
+function formatRelativeTime(iso: string) {
+  try {
+    const sec = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+    if (sec < 60) {
+      return "刚刚";
+    }
+    if (sec < 3600) {
+      return `${Math.floor(sec / 60)} 分钟前`;
+    }
+    if (sec < 86400) {
+      return `${Math.floor(sec / 3600)} 小时前`;
+    }
+    return formatTime(iso);
+  } catch {
+    return formatTime(iso);
+  }
+}
 </script>
 
 <template>
-  <div class="min-h-dvh bg-apple-gray text-apple-black">
-    <!-- Nav -->
-    <header
-      class="sticky top-0 z-50 flex h-11 items-center justify-between border-b border-white/10 bg-black/80 px-4 backdrop-blur-xl backdrop-saturate-[1.8] md:h-12 md:px-6"
+  <div
+    class="min-h-dvh bg-background font-body text-on-surface selection:bg-primary-container selection:text-on-primary-container"
+  >
+    <!-- TopNavBar -->
+    <nav
+      class="fixed top-0 z-50 w-full bg-surface/80 backdrop-blur-md transition-all duration-300 dark:bg-inverse-surface/85"
     >
-      <div class="flex items-center gap-2">
-        <svg
-          class="h-4 w-4 text-white/90"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="1.8"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          aria-hidden="true"
+      <div class="mx-auto flex h-20 max-w-screen-2xl items-center justify-between px-6 md:px-8">
+        <button
+          type="button"
+          class="text-left font-headline text-2xl font-black tracking-tight text-primary"
+          @click="scrollToSection('setup')"
         >
-          <rect x="2" y="4" width="20" height="16" rx="2" />
-          <path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7" />
-        </svg>
-        <span class="text-[13px] font-semibold tracking-tight text-white/90 md:text-sm"
-          >YYDS Mail</span
-        >
+          YYDS Mail
+        </button>
+        <!--<div class="hidden items-center gap-8 md:flex">
+          <button
+            type="button"
+            class="border-primary pb-1 font-medium text-primary transition-colors duration-300 border-b-2"
+            @click="navToInbox"
+          >
+            收件箱
+          </button>
+          <a
+            class="font-medium text-on-surface-variant transition-colors duration-300 hover:text-primary"
+            href="https://vip.215.im/docs"
+            target="_blank"
+            rel="noopener noreferrer"
+            >API</a
+          >
+          <button
+            type="button"
+            class="font-medium text-on-surface-variant transition-colors duration-300 hover:text-primary"
+            @click="scrollToSection('security')"
+          >
+            隐私与安全
+          </button>
+        </div>-->
+        <div class="flex items-center gap-3 md:gap-4">
+          <button
+            type="button"
+            class="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-on-surface-variant transition-all hover:text-primary active:scale-95"
+            :aria-label="isDark ? '切换浅色' : '切换深色'"
+            @click="toggleDark"
+          >
+            <span class="material-symbols-outlined text-[22px] leading-none" aria-hidden="true">{{
+              isDark ? "light_mode" : "dark_mode"
+            }}</span>
+          </button>
+          <a
+            class="inline-flex h-10 items-center rounded-xl bg-primary px-4 font-headline text-sm font-bold leading-none tracking-wide text-on-primary shadow-sm transition-all hover:brightness-110 active:scale-95 md:px-6"
+            href="https://vip.215.im/dashboard"
+            target="_blank"
+            rel="noopener noreferrer"
+            >控制台与文档</a
+          >
+        </div>
       </div>
-      <a
-        class="rounded-full bg-apple-blue px-3 py-1 text-xs font-medium text-white transition-all duration-200 hover:bg-apple-blue-hover active:scale-95"
-        href="https://vip.215.im/docs"
-        target="_blank"
-        rel="noopener noreferrer"
-        >API 文档</a
-      >
-    </header>
+    </nav>
 
-    <!-- Hero Banner -->
-    <section class="bg-white px-4 py-6 text-center md:px-6 md:py-8">
-      <h1 class="text-xl font-semibold tracking-tight text-apple-black md:text-2xl">临时邮箱</h1>
-      <p class="mx-auto mt-1.5 max-w-md text-[13px] leading-relaxed text-black/50 md:text-sm">
-        快速生成临时邮箱地址，自动识别并提取验证码
-      </p>
-    </section>
-
-    <main class="mx-auto max-w-[720px] px-4 pb-8 pt-4 md:px-6 md:pb-12 md:pt-6">
+    <main class="mx-auto max-w-7xl px-6 pb-20 pt-32">
       <!-- Toast -->
       <Transition name="fade">
         <p
           v-if="toast"
-          class="fixed bottom-6 left-1/2 z-60 -translate-x-1/2 rounded-full bg-apple-black px-5 py-2 text-[13px] font-medium text-white shadow-lg"
+          class="fixed bottom-6 left-1/2 z-60 -translate-x-1/2 rounded-full bg-inverse-surface px-5 py-2 text-[13px] font-medium text-inverse-on-surface shadow-lg dark:bg-surface-container-high dark:text-on-surface"
           role="status"
         >
           {{ toast }}
@@ -344,470 +606,461 @@ function formatTime(iso: string) {
       <Transition name="slide-fade">
         <div
           v-if="error"
-          class="mb-4 flex items-start gap-2.5 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-[13px] text-red-700 md:text-sm"
+          class="mb-6 flex items-start gap-2.5 rounded-2xl border border-error/25 bg-error-container px-4 py-3 text-[13px] text-on-error-container md:text-sm"
           role="alert"
         >
-          <svg
-            class="mt-0.5 h-4 w-4 shrink-0 text-red-400"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            aria-hidden="true"
-          >
-            <circle cx="12" cy="12" r="10" />
-            <line x1="12" y1="8" x2="12" y2="12" />
-            <line x1="12" y1="16" x2="12.01" y2="16" />
-          </svg>
+          <span class="material-symbols-outlined shrink-0 text-error">error</span>
           <span>{{ error }}</span>
         </div>
       </Transition>
 
-      <!-- Setup Card -->
-      <div class="mb-5 overflow-hidden rounded-2xl bg-white shadow-sm ring-1 ring-black/4">
-        <div class="px-4 py-4 md:px-6 md:py-5">
-          <!-- API Key Header -->
-          <div class="mb-3 flex items-center justify-between">
-            <label for="api-key-input" class="text-[13px] font-semibold text-apple-black md:text-sm"
-              >API Key</label
-            >
-            <code
-              class="rounded-md bg-apple-gray px-2 py-0.5 font-mono text-[11px] text-black/40"
-              :title="API_BASE_URL"
-              >{{ API_BASE_URL }}</code
-            >
-          </div>
-
-          <!-- API Key Input -->
-          <div class="flex gap-2">
-            <div class="relative flex-1">
-              <input
-                id="api-key-input"
-                v-model="apiKey"
-                :type="showApiKey ? 'text' : 'password'"
-                autocomplete="off"
-                placeholder="粘贴 API Key（AC- 开头）"
-                class="h-10 w-full rounded-lg border border-apple-border bg-apple-gray px-3 text-sm tracking-tight outline-none transition-all duration-200 placeholder:text-black/30 focus:border-apple-blue focus:bg-white focus:ring-2 focus:ring-apple-blue/20"
-              />
-            </div>
-            <button
-              type="button"
-              class="h-10 shrink-0 rounded-lg border border-apple-border bg-white px-3 text-[13px] text-apple-black transition-all duration-200 hover:bg-apple-gray active:scale-[0.97]"
-              :aria-label="showApiKey ? '隐藏密钥' : '显示密钥'"
-              @click="showApiKey = !showApiKey"
-            >
-              <!-- Eye icon -->
-              <svg
-                v-if="!showApiKey"
-                class="h-4 w-4 text-black/50"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.8"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                aria-hidden="true"
-              >
-                <path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z" />
-                <circle cx="12" cy="12" r="3" />
-              </svg>
-              <svg
-                v-else
-                class="h-4 w-4 text-black/50"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.8"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                aria-hidden="true"
-              >
-                <path d="M9.88 9.88a3 3 0 1 0 4.24 4.24" />
-                <path
-                  d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68"
-                />
-                <path d="M6.61 6.61A13.526 13.526 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61" />
-                <line x1="2" y1="2" x2="22" y2="22" />
-              </svg>
-            </button>
-          </div>
-
-          <!-- Optional Fields -->
-          <div class="mt-4 grid gap-3 sm:grid-cols-2">
-            <div>
-              <label for="prefix-input" class="mb-1 block text-[12px] font-medium text-black/45"
-                >前缀（可选）</label
-              >
-              <input
-                id="prefix-input"
-                v-model="addressPrefix"
-                type="text"
-                class="h-10 w-full rounded-lg border border-apple-border bg-apple-gray px-3 text-sm outline-none transition-all duration-200 placeholder:text-black/30 focus:border-apple-blue focus:bg-white focus:ring-2 focus:ring-apple-blue/20"
-                placeholder="my-app"
-              />
-            </div>
-            <div>
-              <label for="domain-input" class="mb-1 block text-[12px] font-medium text-black/45"
-                >域名（可选）</label
-              >
-              <input
-                id="domain-input"
-                v-model="domain"
-                type="text"
-                class="h-10 w-full rounded-lg border border-apple-border bg-apple-gray px-3 text-sm outline-none transition-all duration-200 placeholder:text-black/30 focus:border-apple-blue focus:bg-white focus:ring-2 focus:ring-apple-blue/20"
-                placeholder="默认域名"
-              />
-            </div>
-          </div>
-        </div>
-
-        <!-- Action Bar -->
-        <div
-          class="flex flex-wrap items-center gap-2 border-t border-black/4 bg-[#fafafa] px-4 py-3 md:px-6"
-        >
-          <button
-            type="button"
-            :disabled="loading"
-            class="h-9 cursor-pointer rounded-full bg-apple-blue px-5 text-[13px] font-medium text-white transition-all duration-200 hover:bg-apple-blue-hover active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-50"
-            @click="createInbox"
+      <!-- Hero -->
+      <section class="mb-16 grid grid-cols-1 gap-8 lg:grid-cols-12">
+        <div id="setup" class="flex flex-col justify-center lg:col-span-7">
+          <h1
+            class="mb-6 font-headline text-4xl font-extrabold leading-[1.1] tracking-tight text-on-surface md:text-5xl lg:text-6xl"
           >
-            <span v-if="loading" class="flex items-center gap-1.5">
-              <svg
-                class="h-3.5 w-3.5 animate-spin"
-                viewBox="0 0 24 24"
-                fill="none"
-                aria-hidden="true"
-              >
-                <circle
-                  class="opacity-25"
-                  cx="12"
-                  cy="12"
-                  r="10"
-                  stroke="currentColor"
-                  stroke-width="3"
-                />
-                <path
-                  class="opacity-75"
-                  fill="currentColor"
-                  d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
-                />
-              </svg>
-              处理中
-            </span>
-            <span v-else>生成临时邮箱</span>
-          </button>
-          <template v-if="hasInbox">
-            <button
-              type="button"
-              :disabled="loading"
-              class="h-9 cursor-pointer rounded-full border border-apple-blue/30 px-4 text-[13px] font-medium text-apple-blue transition-all duration-200 hover:bg-apple-blue/5 active:scale-[0.97] disabled:opacity-50"
-              @click="refreshToken"
-            >
-              刷新令牌
-            </button>
-            <button
-              type="button"
-              class="h-9 cursor-pointer rounded-full border border-apple-border px-4 text-[13px] text-apple-black/70 transition-all duration-200 hover:bg-black/3 active:scale-[0.97]"
-              @click="clearInbox"
-            >
-              清除会话
-            </button>
-          </template>
-        </div>
-      </div>
+            <span class="text-primary">临时邮箱</span>收验证码，真实邮箱不必露面。
+          </h1>
+          <p class="mb-8 max-w-xl text-lg leading-relaxed text-on-surface-variant">
+            几秒生成地址、自动识别验证码；少填一次真实邮箱，多一分安心。
+          </p>
 
-      <!-- Active Inbox Card -->
-      <Transition name="slide-fade">
-        <div
-          v-if="hasInbox"
-          class="mb-5 overflow-hidden rounded-2xl bg-apple-black p-4 text-white shadow-lg md:p-5"
-        >
-          <div class="flex items-start justify-between gap-3">
-            <div class="min-w-0 flex-1">
-              <div class="mb-1 text-[11px] font-semibold uppercase tracking-widest text-white/40">
-                当前邮箱
+          <div
+            class="rounded-xl border border-outline-variant/10 bg-surface-container-low p-6 shadow-sm"
+          >
+            <template v-if="!hasInbox">
+              <div class="mb-4 flex flex-wrap items-center justify-between gap-2">
+                <span class="font-headline text-sm font-bold text-on-surface">连接服务</span>
+                <code
+                  class="max-w-[min(100%,14rem)] truncate rounded-lg bg-surface-container px-2 py-1 font-mono text-[11px] text-on-surface-variant"
+                  :title="API_BASE_URL"
+                  >{{ API_BASE_URL }}</code
+                >
               </div>
-              <p
-                class="break-all font-mono text-[15px] leading-relaxed tracking-wide text-white/95 md:text-base"
-              >
-                {{ inbox!.address }}
-              </p>
-              <p class="mt-2 flex items-center gap-2 text-[12px] text-white/45">
-                <span>{{ formatTime(inbox!.expiresAt) }} 过期</span>
-                <span
-                  class="inline-block h-0.5 w-0.5 rounded-full bg-white/30"
-                  aria-hidden="true"
-                ></span>
-                <span>{{ unreadCount }} 封未读</span>
-              </p>
-            </div>
-            <button
-              type="button"
-              class="shrink-0 cursor-pointer rounded-full bg-apple-blue px-4 py-2 text-[13px] font-medium text-white transition-all duration-200 hover:bg-apple-blue-hover active:scale-[0.97]"
-              @click="copyText(inbox!.address, '邮箱已复制')"
-            >
-              复制地址
-            </button>
+              <div class="flex flex-col gap-4 md:flex-row">
+                <div class="relative min-w-0 flex-1">
+                  <input
+                    v-model="apiKey"
+                    :type="showApiKey ? 'text' : 'password'"
+                    autocomplete="off"
+                    placeholder="粘贴 API Key（AC- 开头）"
+                    class="focus:ring-primary/20 w-full rounded-xl border-none bg-surface-container-highest px-5 py-4 font-mono text-sm text-on-surface outline-none ring-0 transition-all placeholder:text-on-surface-variant focus:ring-2 dark:bg-surface-container-high"
+                  />
+                  <button
+                    type="button"
+                    class="absolute right-3 top-1/2 inline-flex h-10 w-10 -translate-y-1/2 items-center justify-center rounded-lg text-primary transition-colors hover:bg-primary/10"
+                    :aria-label="showApiKey ? '隐藏密钥' : '显示密钥'"
+                    @click="showApiKey = !showApiKey"
+                  >
+                    <span
+                      class="material-symbols-outlined text-[22px] leading-none"
+                      aria-hidden="true"
+                      >{{ showApiKey ? "visibility_off" : "visibility" }}</span
+                    >
+                  </button>
+                </div>
+                <button
+                  type="button"
+                  :disabled="loading"
+                  class="flex shrink-0 items-center justify-center gap-2 rounded-xl bg-primary px-6 py-4 font-headline font-bold text-on-primary transition-all hover:-translate-y-0.5 hover:shadow-lg active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-50"
+                  @click="createInbox"
+                >
+                  <span v-if="loading" class="material-symbols-outlined animate-spin text-[22px]"
+                    >progress_activity</span
+                  >
+                  <span v-else class="material-symbols-outlined text-[22px]">add_circle</span>
+                  生成临时邮箱
+                </button>
+              </div>
+              <div class="mt-4 grid gap-3 sm:grid-cols-2">
+                <div>
+                  <label
+                    for="prefix-input"
+                    class="mb-1 block text-xs font-medium text-on-surface-variant"
+                    >前缀（可选）</label
+                  >
+                  <input
+                    id="prefix-input"
+                    v-model="addressPrefix"
+                    type="text"
+                    class="w-full rounded-xl border border-outline-variant/20 bg-surface px-3 py-2.5 text-sm outline-none transition-all focus:border-primary focus:ring-2 focus:ring-primary/15 dark:bg-surface-container"
+                    placeholder="my-app"
+                  />
+                </div>
+                <div>
+                  <label
+                    for="domain-input"
+                    class="mb-1 block text-xs font-medium text-on-surface-variant"
+                    >域名（可选）</label
+                  >
+                  <input
+                    id="domain-input"
+                    v-model="domain"
+                    type="text"
+                    class="w-full rounded-xl border border-outline-variant/20 bg-surface px-3 py-2.5 text-sm outline-none transition-all focus:border-primary focus:ring-2 focus:ring-primary/15 dark:bg-surface-container"
+                    placeholder="默认域名"
+                  />
+                </div>
+              </div>
+            </template>
+
+            <template v-else>
+              <div class="flex flex-col gap-4 md:flex-row">
+                <div class="relative min-w-0 flex-1">
+                  <input
+                    readonly
+                    type="text"
+                    :value="inbox!.address"
+                    class="focus:ring-primary/20 w-full rounded-xl border-none bg-surface-container-highest px-5 py-4 font-headline text-lg font-bold text-primary outline-none focus:ring-2 md:text-xl dark:bg-surface-container-high"
+                  />
+                  <div class="absolute right-3 top-1/2 flex -translate-y-1/2 items-center gap-1">
+                    <button
+                      type="button"
+                      class="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-primary transition-colors hover:bg-primary/10"
+                      title="复制地址"
+                      @click="copyText(inbox!.address, '地址已复制')"
+                    >
+                      <span
+                        class="material-symbols-outlined text-[22px] leading-none"
+                        aria-hidden="true"
+                        >content_copy</span
+                      >
+                    </button>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  :disabled="loading"
+                  class="flex shrink-0 items-center justify-center gap-2 rounded-xl bg-primary px-6 py-4 font-headline font-bold text-on-primary transition-all hover:-translate-y-0.5 hover:shadow-lg active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-50"
+                  @click="createAnotherInbox"
+                >
+                  <span
+                    v-if="loading"
+                    class="material-symbols-outlined animate-spin text-[22px] leading-none"
+                    >progress_activity</span
+                  >
+                  <span
+                    v-else
+                    class="material-symbols-outlined text-[22px] leading-none"
+                    aria-hidden="true"
+                    >add_circle</span
+                  >
+                  新建并复制
+                </button>
+              </div>
+              <div class="mt-6 flex flex-wrap items-center justify-between gap-3 px-1">
+                <div class="flex min-w-0 flex-1 flex-wrap items-center gap-x-3 gap-y-2">
+                  <template v-if="setupInboxCodes.length">
+                    <div class="flex flex-wrap items-center gap-2">
+                      <span
+                        class="material-symbols-outlined shrink-0 text-primary"
+                        style="font-size: 20px"
+                        aria-hidden="true"
+                        >key</span
+                      >
+                      <button
+                        v-for="c in setupInboxCodes"
+                        :key="`setup-${c.code}-${c.source}`"
+                        type="button"
+                        class="inline-flex cursor-pointer items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 font-mono text-sm font-semibold tracking-wider text-on-primary transition-all hover:brightness-110 active:scale-[0.98]"
+                        @click="copyText(c.code, '验证码已复制')"
+                      >
+                        {{ c.code }}
+                        <span
+                          class="material-symbols-outlined text-[18px] opacity-80"
+                          aria-hidden="true"
+                          >content_copy</span
+                        >
+                      </button>
+                    </div>
+                  </template>
+                  <div v-else class="flex flex-wrap items-center gap-x-3 gap-y-1">
+                    <div class="flex items-center gap-3">
+                      <div class="bg-primary h-2.5 w-2.5 shrink-0 rounded-full pulse-animation" />
+                      <span
+                        class="font-label text-xs font-medium uppercase tracking-widest text-on-surface-variant"
+                        >等待接收邮件…</span
+                      >
+                    </div>
+                    <span
+                      v-if="nextPollCountdownSec !== null"
+                      class="font-label text-xs font-medium tabular-nums tracking-widest text-on-surface-variant/90"
+                      aria-live="polite"
+                      >{{ nextPollCountdownSec }}s 后检查</span
+                    >
+                  </div>
+                  <span
+                    v-if="unreadCount > 0"
+                    class="font-label text-xs font-medium uppercase tracking-widest text-on-surface-variant"
+                    >· {{ unreadCount }} 封未读</span
+                  >
+                </div>
+                <!--<div
+                  class="rounded-full bg-tertiary-container px-3 py-1 text-xs font-bold uppercase tracking-tighter text-on-tertiary-container"
+                >
+                  剩余 {{ expiresCountdown }}
+                </div>-->
+              </div>
+              <div class="mt-4 flex flex-wrap gap-2 border-t border-outline-variant/15 pt-4">
+                <button
+                  type="button"
+                  :disabled="loading"
+                  class="rounded-xl border border-outline-variant/25 bg-surface-container-high px-4 py-2 text-sm font-medium text-on-surface transition-colors hover:bg-surface-container-highest disabled:opacity-50 dark:border-outline-variant/40"
+                  @click="refreshToken"
+                >
+                  刷新令牌
+                </button>
+                <button
+                  type="button"
+                  :disabled="loading"
+                  class="rounded-xl border border-outline-variant/25 bg-surface px-4 py-2 text-sm text-on-surface-variant transition-colors hover:bg-surface-container-low disabled:opacity-50 dark:border-outline-variant/40"
+                  @click="clearInbox"
+                >
+                  清除会话
+                </button>
+              </div>
+            </template>
           </div>
         </div>
-      </Transition>
 
-      <!-- Inbox Section -->
-      <template v-if="hasInbox">
-        <div class="mb-3 flex items-center justify-between">
-          <h2 class="text-base font-semibold tracking-tight text-apple-black md:text-lg">收件箱</h2>
+        <div class="relative hidden lg:col-span-5 lg:block">
+          <div
+            class="h-full w-full rotate-3 transform overflow-hidden rounded-3xl shadow-2xl transition-transform duration-700 hover:rotate-0"
+          >
+            <img
+              alt="抽象靛蓝与白色流体纹理"
+              class="h-full min-h-[320px] w-full object-cover"
+              src="https://lh3.googleusercontent.com/aida-public/AB6AXuBQnQEidMhFv5CwmgZ2ekh6KOsRLoXjEjyQCv9tEAU3jvC3njIyRmswZMy3guTXYrZjrwni03BbpPnYubdCvFQD0mkKfs4T6TcCRSvMNHGkrsEycuTkDDv3y7EXWdC9I8WC8XktAHy9vWLs5waZpuN1aGWSLdZryiYA8cAtbs2JxABZM7kQL0qRflmBtXbxnKHSBtxaxAqULDlSlVbehFjadnWwDI958YCEX0KaLEHA7PefMJKaDZp_JOhw8QgWKJtbem90IXEhDnI"
+            />
+          </div>
+          <!--<div
+            class="glass-effect absolute -bottom-6 -left-6 max-w-[240px] rounded-2xl p-6 shadow-xl"
+          >
+            <div class="mb-3 flex items-center gap-4">
+              <div
+                class="flex h-10 w-10 items-center justify-center rounded-full bg-primary/20"
+              >
+                <span
+                  class="material-symbols-outlined text-primary"
+                  style="font-variation-settings: 'FILL' 1"
+                  >verified_user</span
+                >
+              </div>
+              <div class="font-headline text-sm font-bold text-on-surface">
+                隐私优先
+              </div>
+            </div>
+            <p class="text-xs leading-relaxed text-on-surface-variant">
+              会话与邮件数据遵循服务条款；请仅用于合法用途。
+            </p>
+          </div>-->
+        </div>
+      </section>
+
+      <!-- Inbox -->
+      <section v-if="hasInbox" id="inbox" class="rounded-3xl bg-surface-container-low p-8 md:p-12">
+        <div class="mb-10 flex flex-col justify-between gap-6 md:flex-row md:items-end">
+          <div>
+            <h2 class="mb-2 font-headline text-3xl font-extrabold tracking-tight">收件箱</h2>
+            <p class="text-on-surface-variant">实时查看临时邮箱收到的邮件。</p>
+          </div>
           <button
             type="button"
-            class="flex h-8 cursor-pointer items-center gap-1.5 rounded-full bg-white px-3 text-[13px] text-black/65 shadow-sm ring-1 ring-black/6 transition-all duration-200 hover:bg-apple-gray active:scale-[0.97]"
+            class="rounded-xl border border-outline-variant/10 bg-surface-container-high px-4 py-2 text-sm font-medium text-on-surface transition-colors hover:bg-surface-container-highest dark:border-outline-variant/30"
             @click="fetchMessages"
           >
-            <svg
-              class="h-3.5 w-3.5"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              aria-hidden="true"
-            >
-              <path
-                d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.3"
-              />
-            </svg>
-            刷新
+            刷新列表
           </button>
         </div>
 
-        <!-- Message List -->
-        <div v-if="visibleMessages.length" class="space-y-2">
-          <div v-for="m in visibleMessages" :key="m.id">
+        <div v-if="visibleMessagesWithCodes.length" class="space-y-3">
+          <div v-for="m in visibleMessagesWithCodes" :key="m.id">
             <div
-              class="overflow-hidden rounded-xl bg-white shadow-sm ring-1 transition-all duration-200"
+              class="overflow-hidden rounded-2xl border transition-all"
               :class="
                 selectedId === m.id
-                  ? 'ring-apple-blue shadow-md'
-                  : 'ring-black/4 hover:shadow-md hover:ring-black/8'
+                  ? 'border-primary/35 shadow-md ring-1 ring-primary/20'
+                  : 'border-outline-variant/10 dark:border-outline-variant/25'
               "
             >
-              <!-- Verification Code Strip -->
               <div
-                v-if="listRowCodes(m).length"
-                class="flex flex-wrap items-center gap-2 border-b border-black/4 bg-[#f0f5ff] px-4 py-2.5"
+                v-if="m._codes.length"
+                class="flex flex-wrap items-center gap-2 border-b border-outline-variant/10 bg-primary-fixed/40 px-4 py-2.5 dark:bg-primary/15"
               >
-                <svg
-                  class="h-4 w-4 text-apple-blue/60"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  aria-hidden="true"
+                <span class="material-symbols-outlined text-primary" style="font-size: 20px"
+                  >key</span
                 >
-                  <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
-                  <path d="M7 11V7a5 5 0 0 1 10 0v4" />
-                </svg>
                 <button
-                  v-for="c in listRowCodes(m)"
+                  v-for="c in m._codes"
                   :key="`${m.id}-${c.code}-${c.source}`"
                   type="button"
-                  class="inline-flex cursor-pointer items-center gap-1.5 rounded-lg bg-apple-blue px-3 py-1.5 font-mono text-sm font-semibold tracking-wider text-white transition-all duration-150 hover:bg-apple-blue-hover active:scale-[0.96]"
+                  class="inline-flex cursor-pointer items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 font-mono text-sm font-semibold tracking-wider text-on-primary transition-all hover:brightness-110 active:scale-[0.98]"
                   @click.stop="copyText(c.code, '验证码已复制')"
                 >
                   {{ c.code }}
-                  <svg
-                    class="h-3.5 w-3.5 opacity-70"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    aria-hidden="true"
-                  >
-                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
-                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-                  </svg>
+                  <span class="material-symbols-outlined text-[18px] opacity-80">content_copy</span>
                 </button>
               </div>
 
-              <!-- Message Row -->
-              <button
-                type="button"
-                class="w-full cursor-pointer px-4 py-3 text-left transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-apple-blue md:py-3.5"
+              <div
+                class="group flex cursor-pointer flex-col gap-4 p-5 transition-all md:flex-row md:items-center"
+                :class="
+                  m.seen
+                    ? 'bg-surface hover:border-primary/20 hover:bg-surface-container-high border border-transparent hover:scale-[1.01]'
+                    : 'border-primary/15 bg-primary-container/10 hover:bg-primary-container/20 hover:scale-[1.01] border'
+                "
+                role="button"
+                tabindex="0"
                 @click="openMessage(m.id)"
+                @keydown.enter="openMessage(m.id)"
               >
-                <div class="flex items-start justify-between gap-3">
-                  <span
-                    class="text-[14px] font-semibold leading-snug text-apple-black md:text-[15px]"
-                    >{{ m.subject || "(无主题)" }}</span
-                  >
-                  <span class="shrink-0 text-[12px] tabular-nums text-black/35">{{
-                    formatTime(m.createdAt)
+                <div
+                  class="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl"
+                  :class="
+                    m.seen
+                      ? 'bg-surface-container-highest text-on-surface-variant dark:bg-surface-container-high'
+                      : 'bg-primary text-on-primary shadow-md'
+                  "
+                >
+                  <span class="material-symbols-outlined">{{
+                    m.seen ? "alternate_email" : "mark_email_unread"
                   }}</span>
                 </div>
-                <p class="mt-1 text-[13px] text-black/50">
-                  {{ m.from?.name ? `${m.from.name} ` : "" }}{{ m.from?.address }}
-                </p>
-              </button>
+                <div class="min-w-0 flex-1">
+                  <div class="mb-1 flex items-start justify-between gap-3">
+                    <div class="flex min-w-0 items-center gap-2">
+                      <span
+                        v-if="!m.seen"
+                        class="bg-primary h-2 w-2 shrink-0 rounded-full"
+                        aria-hidden="true"
+                      />
+                      <h4
+                        class="truncate font-headline text-lg"
+                        :class="
+                          m.seen ? 'font-bold text-on-surface' : 'font-extrabold text-on-surface'
+                        "
+                      >
+                        {{ m.subject || "(无主题)" }}
+                      </h4>
+                    </div>
+                    <span
+                      class="whitespace-nowrap font-label text-xs uppercase tracking-widest"
+                      :class="m.seen ? 'text-on-surface-variant' : 'font-bold text-primary'"
+                      >{{ formatRelativeTime(m.createdAt) }}</span
+                    >
+                  </div>
+                  <p
+                    class="truncate font-body text-sm"
+                    :class="m.seen ? 'text-on-surface-variant' : 'font-semibold text-on-surface'"
+                  >
+                    {{ m.from?.name ? `${m.from.name} ` : "" }}{{ m.from?.address }}
+                  </p>
+                </div>
+                <div
+                  class="flex gap-2 opacity-100 md:opacity-0 md:transition-opacity md:group-hover:opacity-100"
+                >
+                  <button
+                    type="button"
+                    class="rounded-lg p-2 text-on-surface-variant transition-colors hover:text-primary"
+                    aria-label="查看"
+                    @click.stop="openMessage(m.id)"
+                  >
+                    <span class="material-symbols-outlined">visibility</span>
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
         </div>
 
-        <!-- Empty: filtered out -->
         <div
-          v-else-if="messages.length > 0 && visibleMessages.length === 0"
-          class="rounded-2xl bg-white px-4 py-10 text-center shadow-sm ring-1 ring-black/4"
+          v-else-if="messages.length > 0 && visibleMessagesWithCodes.length === 0"
+          class="flex flex-col items-center justify-center py-16 text-center"
         >
           <div
-            class="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-full bg-apple-gray"
+            class="mb-5 flex h-20 w-20 items-center justify-center rounded-full bg-surface-container-highest"
           >
-            <svg
-              class="h-6 w-6 text-black/25"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.5"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              aria-hidden="true"
+            <span class="material-symbols-outlined text-4xl text-outline-variant"
+              >filter_alt_off</span
             >
-              <path d="M3 7a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
-              <path d="m3 7 9 6 9-6" />
-            </svg>
           </div>
-          <p class="text-[13px] font-medium text-black/50">当前仅有欢迎/营销类邮件，已自动隐藏</p>
+          <h3 class="mb-2 font-headline text-xl font-bold">已隐藏营销类邮件</h3>
+          <p class="max-w-xs text-on-surface-variant">当前仅有欢迎或推广类邮件，已按规则过滤。</p>
         </div>
 
-        <!-- Empty: no messages -->
-        <div
-          v-else
-          class="rounded-2xl bg-white px-4 py-10 text-center shadow-sm ring-1 ring-black/4"
-        >
+        <div v-else class="flex flex-col items-center justify-center py-16 text-center">
           <div
-            class="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-full bg-apple-gray"
+            class="mb-5 flex h-20 w-20 items-center justify-center rounded-full bg-surface-container-highest"
           >
-            <svg
-              class="h-6 w-6 animate-pulse text-black/25"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.5"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              aria-hidden="true"
+            <span class="material-symbols-outlined animate-pulse text-4xl text-outline-variant"
+              >inbox</span
             >
-              <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
-            </svg>
           </div>
-          <p class="text-[14px] font-medium text-apple-black/60">等待接收邮件</p>
-          <p class="mt-1 text-[12px] text-black/35">
-            每 {{ pollMs / 1000 }} 秒自动检查，验证码会自动提取
+          <h3 class="mb-2 font-headline text-xl font-bold">暂无邮件</h3>
+          <p class="max-w-xs text-on-surface-variant">
+            新邮件将自动出现在此列表，约每 {{ pollMs / 1000 }} 秒检查一次。
           </p>
         </div>
 
-        <!-- Detail Panel -->
+        <!-- Detail -->
         <Transition name="slide-fade">
           <div
             v-if="selectedId"
-            class="mt-4 overflow-hidden rounded-2xl bg-white shadow-sm ring-1 ring-black/4"
+            class="border-outline-variant/15 mt-8 overflow-hidden rounded-2xl border bg-surface shadow-sm"
           >
-            <div class="border-b border-black/4 px-4 py-3 md:px-6 md:py-4">
-              <div class="flex items-center justify-between">
-                <h3 class="text-[14px] font-semibold text-apple-black md:text-[15px]">邮件详情</h3>
-                <button
-                  type="button"
-                  class="flex h-7 w-7 cursor-pointer items-center justify-center rounded-full text-black/30 transition-colors hover:bg-black/4 hover:text-black/50"
-                  aria-label="关闭详情"
-                  @click="
-                    selectedId = null;
-                    detail = null;
-                  "
-                >
-                  <svg
-                    class="h-4 w-4"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    aria-hidden="true"
-                  >
-                    <line x1="18" y1="6" x2="6" y2="18" />
-                    <line x1="6" y1="6" x2="18" y2="18" />
-                  </svg>
-                </button>
-              </div>
+            <div
+              class="border-outline-variant/15 flex items-center justify-between border-b px-5 py-4 md:px-6"
+            >
+              <h3 class="font-headline text-base font-bold text-on-surface">邮件详情</h3>
+              <button
+                type="button"
+                class="rounded-full p-2 text-on-surface-variant transition-colors hover:bg-surface-container-low hover:text-on-surface"
+                aria-label="关闭详情"
+                @click="
+                  selectedId = null;
+                  detail = null;
+                "
+              >
+                <span class="material-symbols-outlined">close</span>
+              </button>
             </div>
 
-            <div class="px-4 py-4 md:px-6 md:py-5">
-              <!-- Loading skeleton -->
+            <div class="px-5 py-5 md:px-6">
               <div v-if="detailLoading" class="space-y-3">
-                <div class="skeleton h-5 w-3/4"></div>
-                <div class="skeleton h-4 w-1/2"></div>
-                <div class="skeleton mt-4 h-32 w-full"></div>
+                <div class="skeleton h-5 w-3/4" />
+                <div class="skeleton h-4 w-1/2" />
+                <div class="skeleton mt-4 h-32 w-full" />
               </div>
 
               <template v-else-if="detail">
-                <!-- Verification Codes -->
                 <div v-if="verificationCodes.length" class="mb-4 flex flex-wrap gap-2">
                   <button
                     v-for="c in verificationCodes"
                     :key="c.code + c.source"
                     type="button"
-                    class="inline-flex cursor-pointer items-center gap-2 rounded-xl bg-apple-blue px-5 py-2.5 font-mono text-lg font-semibold tracking-widest text-white transition-all duration-150 hover:bg-apple-blue-hover active:scale-[0.97]"
+                    class="inline-flex cursor-pointer items-center gap-2 rounded-xl bg-primary px-5 py-2.5 font-mono text-lg font-semibold tracking-widest text-on-primary transition-all hover:brightness-110 active:scale-[0.98]"
                     @click="copyText(c.code, '验证码已复制')"
                   >
                     {{ c.code }}
-                    <svg
-                      class="h-4 w-4 opacity-70"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-width="2"
-                      stroke-linecap="round"
-                      stroke-linejoin="round"
-                      aria-hidden="true"
+                    <span class="material-symbols-outlined text-[20px] opacity-90"
+                      >content_copy</span
                     >
-                      <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
-                      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-                    </svg>
                   </button>
                 </div>
 
-                <!-- Subject -->
-                <p class="text-[15px] font-semibold leading-snug text-apple-black md:text-base">
+                <p class="text-base font-semibold leading-snug text-on-surface md:text-[17px]">
                   {{ detail.subject || "(无主题)" }}
                 </p>
 
-                <!-- Notices -->
                 <div
                   v-if="
                     verificationCodes.length === 0 &&
                     subjectHasVerificationMarker(detail.subject ?? '')
                   "
-                  class="mt-3 flex items-start gap-2 rounded-xl bg-amber-50 px-3 py-2.5 text-[13px] text-amber-800"
+                  class="mt-4 flex items-start gap-2 rounded-xl border border-tertiary/20 bg-tertiary-container/50 px-3 py-2.5 text-sm text-on-tertiary-container"
                 >
-                  <svg
-                    class="mt-0.5 h-4 w-4 shrink-0 text-amber-400"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    aria-hidden="true"
-                  >
-                    <path
-                      d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"
-                    />
-                    <line x1="12" y1="9" x2="12" y2="13" />
-                    <line x1="12" y1="17" x2="12.01" y2="17" />
-                  </svg>
+                  <span class="material-symbols-outlined shrink-0 text-tertiary">warning</span>
                   标题已含引导语，但未识别到验证码格式
                 </div>
                 <p
@@ -815,20 +1068,19 @@ function formatTime(iso: string) {
                     verificationCodes.length === 0 &&
                     !subjectHasVerificationMarker(detail.subject ?? '')
                   "
-                  class="mt-2 text-[12px] text-black/35"
+                  class="mt-2 text-xs text-on-surface-variant"
                 >
                   仅当标题包含「Please enter the following code」时从标题解析验证码
                 </p>
 
-                <!-- Body Preview -->
-                <div class="mt-4">
+                <div class="mt-5">
                   <div
-                    class="mb-2 text-[11px] font-semibold uppercase tracking-widest text-black/30"
+                    class="mb-2 text-[11px] font-semibold uppercase tracking-widest text-on-surface-variant"
                   >
                     正文预览
                   </div>
                   <pre
-                    class="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-xl bg-apple-gray p-4 font-mono text-[13px] leading-relaxed text-apple-black/80 md:text-sm"
+                    class="max-h-72 overflow-auto whitespace-pre-wrap wrap-break-word rounded-xl bg-surface-container-low p-4 font-mono text-[13px] leading-relaxed text-on-surface/85 md:text-sm dark:bg-surface-container"
                     >{{ detailPreview }}</pre
                   >
                 </div>
@@ -836,20 +1088,47 @@ function formatTime(iso: string) {
             </div>
           </div>
         </Transition>
-      </template>
+      </section>
+
+      <!-- Security -->
+      <section id="security" class="mt-16 max-w-3xl">
+        <h2 class="mb-3 font-headline text-2xl font-extrabold text-on-surface">隐私与安全</h2>
+        <p class="leading-relaxed text-on-surface-variant">
+          请勿将 API Key
+          或会话令牌提交到公开仓库。临时邮箱仅供合法测试与注册场景使用；请遵守当地法律与服务条款。
+        </p>
+      </section>
     </main>
 
-    <!-- Footer -->
-    <footer class="border-t border-black/4 bg-white/80 px-4 py-5 text-center md:py-6">
-      <a
-        class="text-[13px] text-link transition-opacity hover:opacity-70"
-        href="https://github.com/xiaolajiaoyyds"
-        target="_blank"
-        rel="noopener noreferrer"
-        >GitHub</a
+    <footer
+      class="w-full border-t border-outline-variant/10 bg-surface py-12 dark:bg-inverse-surface/50"
+    >
+      <div
+        class="mx-auto flex max-w-screen-2xl flex-col items-center justify-between gap-6 px-8 md:flex-row"
       >
-      <span class="mx-2 text-black/20" aria-hidden="true">·</span>
-      <span class="text-[12px] text-black/35">仅供合法用途使用</span>
+        <div class="font-headline text-lg font-bold text-on-surface-variant">YYDS Mail</div>
+        <div
+          class="flex flex-wrap justify-center gap-6 font-label text-[10px] font-semibold uppercase tracking-[0.2em] text-on-surface-variant md:gap-8"
+        >
+          <a
+            class="transition-colors hover:text-primary hover:underline hover:decoration-2 hover:underline-offset-4"
+            href="https://github.com/xiaolajiaoyyds"
+            target="_blank"
+            rel="noopener noreferrer"
+            >GitHub</a
+          >
+          <a
+            class="transition-colors hover:text-primary hover:underline hover:decoration-2 hover:underline-offset-4"
+            href="https://vip.215.im/docs"
+            target="_blank"
+            rel="noopener noreferrer"
+            >文档</a
+          >
+        </div>
+        <p class="font-label text-[10px] uppercase tracking-widest text-on-surface-variant/60">
+          仅供合法用途使用
+        </p>
+      </div>
     </footer>
   </div>
 </template>
